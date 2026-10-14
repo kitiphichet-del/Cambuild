@@ -18,6 +18,12 @@ import android.graphics.Matrix
 import android.graphics.Rect
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.util.Size
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
+import kotlin.math.roundToInt
 import android.os.Environment
 import android.provider.MediaStore
 import android.view.Gravity
@@ -66,6 +72,8 @@ class MainActivity : ComponentActivity() {
     private var showingOriginal = false
     private var mode = "Auto"
     private var busy = false
+    private var cameraCapturePending = false
+    private var captureToken = 0
     private val gold = Color.rgb(244, 197, 94)
     private var camera: Camera? = null
     private var flashMode = ImageCapture.FLASH_MODE_OFF
@@ -456,7 +464,18 @@ class MainActivity : ComponentActivity() {
             try {
                 val provider = future.get()
                 val preview = Preview.Builder().build().also { it.setSurfaceProvider(viewFinder.surfaceProvider) }
-                capture = ImageCapture.Builder().setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY).build()
+                // A bounded 5 MP preference prevents large 48/64/108 MP sensor
+                // output and slow manufacturer post-processing on low-end phones.
+                val resolution = ResolutionSelector.Builder()
+                    .setResolutionStrategy(
+                        ResolutionStrategy(Size(2560, 1920),
+                            ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER)
+                    ).build()
+                capture = ImageCapture.Builder()
+                    .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+                    .setResolutionSelector(resolution)
+                    .setJpegQuality(88)
+                    .build()
                 provider.unbindAll()
                 camera = provider.bindToLifecycle(this, selector, preview, capture)
                 capture?.flashMode = flashMode
@@ -467,18 +486,61 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun takePhoto() {
-        val camera = capture ?: run { status("กำลังเตรียมกล้อง"); return }
+        val imageCapture = capture ?: run { status("กล้องยังไม่พร้อม"); return }
+        if (busy || cameraCapturePending) return
         busy = true
-        status("กำลังถ่ายภาพ...")
-        val file = File.createTempFile("lumacam_", ".jpg", cacheDir)
-        camera.takePicture(
-            ImageCapture.OutputFileOptions.Builder(file).build(),
-            ContextCompat.getMainExecutor(this),
-            object : ImageCapture.OnImageSavedCallback {
-                override fun onImageSaved(output: ImageCapture.OutputFileResults) { process(Uri.fromFile(file)) }
-                override fun onError(exception: ImageCaptureException) { busy = false; status("ถ่ายภาพไม่สำเร็จ: ${exception.message}") }
+        cameraCapturePending = true
+        val request = ++captureToken
+        status("● กำลังจับภาพ...")
+        val file = try {
+            File.createTempFile("lumacam_", ".jpg", cacheDir)
+        } catch (e: Exception) {
+            busy = false
+            cameraCapturePending = false
+            status("พื้นที่เก็บข้อมูลไม่พร้อม: ${e.localizedMessage}")
+            return
+        }
+
+        // Some camera drivers never call the completion listener after an
+        // interrupted hardware capture. Unblock the shutter if that happens.
+        Handler(Looper.getMainLooper()).postDelayed({
+            if (cameraCapturePending && request == captureToken) {
+                cameraCapturePending = false
+                busy = false
+                file.delete()
+                status("กล้องใช้เวลานานเกินไป ลองปิดแฟลชแล้วถ่ายใหม่")
             }
-        )
+        }, 15_000L)
+
+        try {
+            imageCapture.takePicture(
+                ImageCapture.OutputFileOptions.Builder(file).build(),
+                ContextCompat.getMainExecutor(this),
+                object : ImageCapture.OnImageSavedCallback {
+                    override fun onImageSaved(output: ImageCapture.OutputFileResults) {
+                        if (!cameraCapturePending || request != captureToken) {
+                            file.delete()
+                            return
+                        }
+                        cameraCapturePending = false
+                        process(Uri.fromFile(file), file)
+                    }
+
+                    override fun onError(exception: ImageCaptureException) {
+                        if (request != captureToken) return
+                        cameraCapturePending = false
+                        busy = false
+                        file.delete()
+                        status("ถ่ายภาพไม่สำเร็จ: ${exception.message}")
+                    }
+                }
+            )
+        } catch (e: Exception) {
+            cameraCapturePending = false
+            busy = false
+            file.delete()
+            status("ไม่สามารถเริ่มจับภาพ: ${e.localizedMessage}")
+        }
     }
 
     private fun decode(uri: Uri): Bitmap {
@@ -488,7 +550,9 @@ class MainActivity : ComponentActivity() {
             BitmapFactory.decodeStream(ins, null, options)
         }
         var sample = 1
-        while (max(options.outWidth, options.outHeight) / sample > 2800) sample *= 2
+        require(options.outWidth > 0 && options.outHeight > 0) { "ไม่สามารถอ่านขนาดภาพ" }
+        // Keep a reasonably sharp ~2K working image; no giant bitmap arrays.
+        while (max(options.outWidth, options.outHeight) / sample > 2200) sample *= 2
         options.inJustDecodeBounds = false
         options.inSampleSize = sample
         val decoded = contentResolver.openInputStream(uri).use { ins ->
@@ -514,37 +578,52 @@ class MainActivity : ComponentActivity() {
         return if (matrix.isIdentity) decoded else Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, matrix, true)
     }
 
-    private fun process(uri: Uri) {
+    private fun process(uri: Uri, temporaryCapture: File? = null) {
         busy = true
-        status("กำลังอ่านและปรับภาพ...")
+        status("กำลังเปิดภาพ...")
+        val selectedMode = mode
         lifecycleScope.launch {
             try {
                 val bitmap = withContext(Dispatchers.IO) { decode(uri) }
+                // The user can see their photo while enhancing continues.
                 original = bitmap
-                val faceBoxes = detectFaces(bitmap)
+                enhanced = null
+                showingOriginal = true
+                photoView.setImageBitmap(bitmap)
+                thumbnail.setImageBitmap(bitmap)
+                galleryGlyph.visibility = View.GONE
+                showReview(true)
+                status("แสดงภาพแล้ว • กำลังปรับแสงและรายละเอียด...")
+                val boxes = detectFaces(bitmap, selectedMode)
                 val output = withContext(Dispatchers.Default) {
-                    PhotoProcessor.enhance(bitmap, mode, faceBoxes)
+                    PhotoProcessor.enhance(bitmap, selectedMode, boxes)
                 }
                 enhanced = output
                 showingOriginal = false
                 photoView.setImageBitmap(output)
                 thumbnail.setImageBitmap(output)
-                galleryGlyph.visibility = View.GONE
-                showReview(true)
-                status("ปรับภาพด้วย $mode สำเร็จ ${if (mode == "Portrait") "· พบใบหน้า ${faceBoxes.size}" else "· ทำงานบนเครื่อง"}")
-            } catch (e: Exception) { status("ประมวลผลไม่ได้: ${e.localizedMessage}") }
-            finally { busy = false }
+                status("แต่งภาพสำเร็จ • ${selectedMode} • พร้อมบันทึก")
+            } catch (e: Exception) {
+                // If enhancement fails after decoding, the original remains
+                // visible and the shutter never stays permanently locked.
+                status("การประมวลผลผิดพลาด: ${e.localizedMessage}")
+            } finally {
+                busy = false
+                temporaryCapture?.let { withContext(Dispatchers.IO) { it.delete() } }
+            }
         }
     }
 
     private fun enhance(bitmap: Bitmap) {
+        if (busy) return
         busy = true
-        status("กำลังปรับภาพโหมด $mode ...")
+        val selectedMode = mode
+        status("กำลังปรับภาพ ${selectedMode} ...")
         lifecycleScope.launch {
             try {
-                val faces = detectFaces(bitmap)
+                val boxes = detectFaces(bitmap, selectedMode)
                 val edited = withContext(Dispatchers.Default) {
-                    PhotoProcessor.enhance(bitmap, mode, faces)
+                    PhotoProcessor.enhance(bitmap, selectedMode, boxes)
                 }
                 enhanced = edited
                 showingOriginal = false
@@ -552,25 +631,52 @@ class MainActivity : ComponentActivity() {
                 thumbnail.setImageBitmap(edited)
                 galleryGlyph.visibility = View.GONE
                 showReview(true)
-                status("ปรับภาพโหมด $mode สำเร็จ")
-            } catch (e: Exception) { status("ไม่สามารถปรับภาพได้: ${e.localizedMessage}") }
-            finally { busy = false }
+                status("แต่งภาพสำเร็จ • ${selectedMode}")
+            } catch (e: Exception) {
+                status("ไม่สามารถปรับภาพได้: ${e.localizedMessage}")
+            } finally {
+                busy = false
+            }
         }
     }
 
-    private suspend fun detectFaces(bitmap: Bitmap): List<Rect> {
-        if (mode != "Portrait") return emptyList()
+    private suspend fun detectFaces(bitmap: Bitmap, selectedMode: String): List<Rect> {
+        if (selectedMode != "Portrait") return emptyList()
+        // ML Kit only needs a preview-sized image to locate faces.
+        val scaled = withContext(Dispatchers.Default) {
+            val maxSide = max(bitmap.width, bitmap.height)
+            if (maxSide <= 800) bitmap else {
+                val factor = 800.0 / maxSide
+                Bitmap.createScaledBitmap(
+                    bitmap,
+                    (bitmap.width * factor).roundToInt().coerceAtLeast(1),
+                    (bitmap.height * factor).roundToInt().coerceAtLeast(1),
+                    true
+                )
+            }
+        }
         val detector = FaceDetection.getClient(
             FaceDetectorOptions.Builder()
                 .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
                 .build()
         )
         return try {
-            detector.process(InputImage.fromBitmap(bitmap, 0)).await().map { it.boundingBox }
+            val scaleX = bitmap.width.toFloat() / scaled.width
+            val scaleY = bitmap.height.toFloat() / scaled.height
+            detector.process(InputImage.fromBitmap(scaled, 0)).await().map {
+                val rect = it.boundingBox
+                Rect(
+                    (rect.left * scaleX).roundToInt(),
+                    (rect.top * scaleY).roundToInt(),
+                    (rect.right * scaleX).roundToInt(),
+                    (rect.bottom * scaleY).roundToInt()
+                )
+            }
         } catch (_: Exception) {
             emptyList()
         } finally {
             detector.close()
+            if (scaled !== bitmap) scaled.recycle()
         }
     }
 
@@ -582,7 +688,7 @@ class MainActivity : ComponentActivity() {
         lifecycleScope.launch {
             try {
                 val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-                val saved = withContext(Dispatchers.IO) {
+                withContext(Dispatchers.IO) {
                     saveOne(a, "LumaCam_${stamp}_ORIGINAL.jpg")
                     saveOne(b, "LumaCam_${stamp}_ENHANCED.jpg")
                 }
