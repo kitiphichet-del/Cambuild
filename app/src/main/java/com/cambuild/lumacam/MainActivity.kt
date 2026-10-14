@@ -1,6 +1,14 @@
 package com.cambuild.lumacam
 
 import android.Manifest
+import android.content.Context
+import android.graphics.Canvas
+import android.graphics.Paint
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+import android.view.MotionEvent
+import androidx.camera.core.Camera
+import androidx.camera.core.FocusMeteringAction
 import android.content.ContentValues
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
@@ -58,6 +66,22 @@ class MainActivity : ComponentActivity() {
     private var showingOriginal = false
     private var mode = "Auto"
     private var busy = false
+    private val gold = Color.rgb(244, 197, 94)
+    private var camera: Camera? = null
+    private var flashMode = ImageCapture.FLASH_MODE_OFF
+    private var gridOn = false
+    private var currentZoom = 1f
+    private lateinit var grid: ThirdsGrid
+    private lateinit var zoomBar: LinearLayout
+    private lateinit var captureRow: LinearLayout
+    private lateinit var reviewRow: LinearLayout
+    private lateinit var flashControl: TextView
+    private lateinit var gridControl: TextView
+    private lateinit var focusRing: TextView
+    private lateinit var thumbnail: ImageView
+    private lateinit var galleryGlyph: TextView
+    private val zoomControls = mutableListOf<Pair<Float, TextView>>()
+    private val modes = mutableMapOf<String, TextView>()
 
     private val permission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
         if (it) startCamera() else status("อนุญาตกล้องเพื่อถ่ายภาพ หรือใช้ปุ่มเลือกรูป")
@@ -86,90 +110,338 @@ class MainActivity : ComponentActivity() {
             setPadding(dp(4), 0, dp(4), 0)
         }
 
+    private fun oval(fill: Int, border: Int = Color.TRANSPARENT, thickness: Int = 0): GradientDrawable =
+        GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(fill)
+            if (thickness > 0) setStroke(dp(thickness), border)
+        }
+
+    private fun rounded(fill: Int, radius: Int = 17): GradientDrawable =
+        GradientDrawable().apply {
+            cornerRadius = dp(radius).toFloat()
+            setColor(fill)
+        }
+
+    private fun txt(value: String, size: Float, color: Int = Color.WHITE, bold: Boolean = false): TextView =
+        TextView(this).apply {
+            text = value
+            textSize = size
+            setTextColor(color)
+            gravity = Gravity.CENTER
+            includeFontPadding = false
+            if (bold) typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
+        }
+
+    private fun chip(value: String): TextView =
+        txt(value, 12f, Color.WHITE, true).apply {
+            setPadding(dp(14), 0, dp(14), 0)
+            background = rounded(Color.rgb(36, 38, 44), 22)
+            isClickable = true
+            isFocusable = true
+        }
+
     private fun buildUi() {
+        window.statusBarColor = Color.BLACK
+        window.navigationBarColor = Color.BLACK
         root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.rgb(13, 18, 29))
-            setPadding(dp(10), dp(12), dp(10), dp(14))
+            setBackgroundColor(Color.BLACK)
         }
         setContentView(root)
-        val title = TextView(this).apply {
-            text = "LumaCam  ·  Smart Photo"
-            textSize = 22f
-            setTextColor(Color.WHITE)
-            setPadding(dp(8), dp(6), 0, dp(8))
-        }
-        root.addView(title)
-        message = TextView(this).apply {
-            setTextColor(Color.rgb(167, 186, 204))
-            textSize = 12.5f
-            text = "พร้อมถ่ายภาพ  |  โหมด Auto"
-            setPadding(dp(8), 0, 0, dp(9))
-        }
-        root.addView(message)
-        val imageFrame = FrameLayout(this)
-        root.addView(imageFrame, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
-        viewFinder = PreviewView(this)
-        imageFrame.addView(viewFinder, FrameLayout.LayoutParams(-1, -1))
-        photoView = ImageView(this).apply {
-            scaleType = ImageView.ScaleType.FIT_CENTER
-            setBackgroundColor(Color.rgb(8, 11, 18))
-            visibility = View.GONE
-        }
-        imageFrame.addView(photoView, FrameLayout.LayoutParams(-1, -1))
-        val chooseMode = HorizontalScrollView(this).apply {
-            isHorizontalScrollBarEnabled = false
-        }
-        val modes = LinearLayout(this).apply {
+
+        val header = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(18), 0, dp(18), 0)
         }
-        chooseMode.addView(modes)
-        root.addView(chooseMode, LinearLayout.LayoutParams(-1, dp(56)))
-        listOf("Auto", "Natural", "Night", "Portrait").forEach { chosen ->
-            val b = button(chosen, if (chosen == mode) Color.rgb(13, 124, 182) else Color.rgb(42,50,68))
-            modes.addView(b, LinearLayout.LayoutParams(dp(99), dp(47)).apply { setMargins(dp(2),dp(4),dp(2),0) })
-            b.setOnClickListener {
-                if (busy) return@setOnClickListener
-                mode = chosen
-                for (j in 0 until modes.childCount) modes.getChildAt(j).setBackgroundColor(
-                    if ((modes.getChildAt(j) as Button).text.toString() == mode) Color.rgb(13,124,182) else Color.rgb(42,50,68)
-                )
-                val saved = original
-                if (saved == null) status("โหมด $mode พร้อมใช้งาน") else enhance(saved)
+        root.addView(header, LinearLayout.LayoutParams(-1, dp(57)))
+        header.addView(txt("LUMACAM", 20f, Color.WHITE, true).apply {
+            gravity = Gravity.CENTER_VERTICAL
+        }, LinearLayout.LayoutParams(0, -1, 1f))
+        header.addView(txt("✦  AI ENHANCE", 10f, gold, true).apply {
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+            background = rounded(Color.rgb(48, 39, 25), 10)
+        })
+
+        val toolbar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(16), 0, dp(16), 0)
+        }
+        root.addView(toolbar, LinearLayout.LayoutParams(-1, dp(47)))
+        toolbar.addView(txt("●  PHOTO", 11f, gold, true).apply {
+            gravity = Gravity.CENTER_VERTICAL
+        }, LinearLayout.LayoutParams(0, -1, 1f))
+        flashControl = chip("⚡ OFF").apply {
+            contentDescription = "Change flash mode"
+            setOnClickListener { cycleFlash() }
+        }
+        toolbar.addView(flashControl, LinearLayout.LayoutParams(-2, dp(35)).apply {
+            rightMargin = dp(8)
+        })
+        gridControl = chip("▦ GRID").apply {
+            contentDescription = "Rule of thirds grid"
+            setOnClickListener {
+                gridOn = !gridOn
+                grid.visibility = if (gridOn && photoView.visibility == View.GONE) View.VISIBLE else View.GONE
+                gridControl.setTextColor(if (gridOn) gold else Color.WHITE)
+                status(if (gridOn) "เปิดเส้นตารางแบ่งภาพ" else "ปิดเส้นตารางแบ่งภาพ")
             }
         }
-        val cameraRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        root.addView(cameraRow, LinearLayout.LayoutParams(-1, dp(67)))
-        fun addAction(label: String, weight: Float, callback: () -> Unit): Button {
-            val b = button(label, Color.rgb(39, 57, 80))
-            cameraRow.addView(b, LinearLayout.LayoutParams(0, dp(57), weight).apply {
-                setMargins(dp(3),dp(4),dp(3),0)
+        toolbar.addView(gridControl, LinearLayout.LayoutParams(-2, dp(35)))
+
+        val finder = FrameLayout(this).apply { setBackgroundColor(Color.rgb(20, 22, 27)) }
+        root.addView(finder, LinearLayout.LayoutParams(-1, 0, 1f))
+        viewFinder = PreviewView(this).apply {
+            scaleType = PreviewView.ScaleType.FILL_CENTER
+            implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+            contentDescription = "Live viewfinder. Tap to focus."
+        }
+        finder.addView(viewFinder, FrameLayout.LayoutParams(-1, -1))
+        viewFinder.setOnTouchListener { _, event ->
+            if (event.action == MotionEvent.ACTION_UP && photoView.visibility == View.GONE) {
+                focusAt(event.x, event.y)
+                true
+            } else event.action == MotionEvent.ACTION_DOWN
+        }
+        grid = ThirdsGrid(this).apply { visibility = View.GONE }
+        finder.addView(grid, FrameLayout.LayoutParams(-1, -1))
+        photoView = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            setBackgroundColor(Color.rgb(15, 16, 20))
+            visibility = View.GONE
+            contentDescription = "Enhanced photo preview"
+        }
+        finder.addView(photoView, FrameLayout.LayoutParams(-1, -1))
+        finder.addView(txt("LIVE  ·  CAMERA", 10f, Color.WHITE, true).apply {
+            background = rounded(Color.argb(172, 10, 10, 14), 10)
+            setPadding(dp(10), dp(7), dp(10), dp(7))
+        }, FrameLayout.LayoutParams(-2, dp(29), Gravity.TOP or Gravity.START).apply {
+            leftMargin = dp(13); topMargin = dp(13)
+        })
+        focusRing = txt("◎", 46f, gold).apply {
+            visibility = View.GONE
+        }
+        finder.addView(focusRing, FrameLayout.LayoutParams(dp(64), dp(64), Gravity.TOP or Gravity.START))
+
+        zoomBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            background = rounded(Color.argb(215, 14, 15, 19), 26)
+            setPadding(dp(8), dp(4), dp(8), dp(4))
+        }
+        finder.addView(zoomBar, FrameLayout.LayoutParams(-2, dp(51), Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
+            bottomMargin = dp(17)
+        })
+        listOf(0.5f to "0.5×", 1f to "1×", 2f to "2×").forEach { (ratio, caption) ->
+            val zoom = txt(caption, 13f, if (ratio == 1f) Color.BLACK else Color.WHITE, true).apply {
+                background = oval(if (ratio == 1f) gold else Color.TRANSPARENT)
+                contentDescription = "Zoom " + caption
+                setOnClickListener { setZoom(ratio) }
+            }
+            zoomBar.addView(zoom, LinearLayout.LayoutParams(dp(41), dp(41)).apply {
+                leftMargin = dp(5); rightMargin = dp(5)
             })
-            b.setOnClickListener { callback() }
-            return b
+            zoomControls.add(ratio to zoom)
         }
-        addAction("รูปในเครื่อง",1f) { if(!busy) gallery.launch("image/*") }
-        addAction("ถ่ายภาพ",1.4f) { if(!busy) takePhoto() }
-        addAction("สลับกล้อง",1f) {
-            selector = if (selector == CameraSelector.DEFAULT_BACK_CAMERA)
-                CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
-            startCamera()
+
+        val footer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(dp(10), dp(9), dp(10), dp(2))
+            setBackgroundColor(Color.rgb(12, 13, 18))
         }
-        val actions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        root.addView(actions, LinearLayout.LayoutParams(-1, dp(58)))
-        compareBtn = button("ต้นฉบับ / ปรับแล้ว")
-        actions.addView(compareBtn, LinearLayout.LayoutParams(0, dp(50),1f).apply { setMargins(dp(3),0,dp(3),0) })
-        compareBtn.setOnClickListener {
-            showingOriginal = !showingOriginal
-            photoView.setImageBitmap(if (showingOriginal) original else enhanced)
-            status(if (showingOriginal) "ภาพต้นฉบับ" else "ภาพที่ปรับแต่งแล้ว")
+        root.addView(footer, LinearLayout.LayoutParams(-1, -2))
+        val modeBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
         }
-        val saveBtn = button("บันทึก 2 ภาพ", Color.rgb(0, 128, 113))
-        actions.addView(saveBtn, LinearLayout.LayoutParams(0, dp(50),1f).apply { setMargins(dp(3),0,dp(3),0) })
-        saveBtn.setOnClickListener { if (!busy) save() }
-        val back = button("กลับสู่กล้อง", Color.rgb(26,35,50))
-        root.addView(back, LinearLayout.LayoutParams(-1, dp(43)).apply { setMargins(dp(3),dp(4),dp(3),0) })
-        back.setOnClickListener { photoView.visibility = View.GONE; status("กลับสู่กล้อง • โหมด $mode") }
+        footer.addView(modeBar, LinearLayout.LayoutParams(-1, dp(41)))
+        listOf("Auto" to "AUTO", "Natural" to "NATURAL", "Night" to "NIGHT", "Portrait" to "PORTRAIT").forEach { (key, caption) ->
+            val modeButton = txt(caption, 11f, if (key == mode) gold else Color.LTGRAY, key == mode).apply {
+                contentDescription = "Enhancement mode " + caption
+                setOnClickListener {
+                    if (!busy) {
+                        mode = key
+                        refreshModes()
+                        val previous = original
+                        if (previous != null && photoView.visibility == View.VISIBLE) enhance(previous)
+                        else status("โหมด " + caption + " พร้อมใช้งาน")
+                    }
+                }
+            }
+            modeBar.addView(modeButton, LinearLayout.LayoutParams(0, -1, 1f))
+            modes[key] = modeButton
+        }
+
+        captureRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(12), dp(6), dp(12), dp(3))
+        }
+        footer.addView(captureRow, LinearLayout.LayoutParams(-1, dp(110)))
+        val galleryBtn = FrameLayout(this).apply {
+            contentDescription = "Choose photo from gallery"
+            isClickable = true
+            isFocusable = true
+            setOnClickListener { if (!busy) gallery.launch("image/*") }
+        }
+        captureRow.addView(galleryBtn, LinearLayout.LayoutParams(0, dp(75), 1f))
+        val square = FrameLayout(this).apply {
+            background = rounded(Color.rgb(37, 40, 45), 14)
+            clipToOutline = true
+        }
+        galleryBtn.addView(square, FrameLayout.LayoutParams(dp(53), dp(53), Gravity.CENTER))
+        thumbnail = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
+        square.addView(thumbnail, FrameLayout.LayoutParams(-1, -1))
+        galleryGlyph = txt("▧", 28f)
+        square.addView(galleryGlyph, FrameLayout.LayoutParams(-1, -1))
+
+        val shutter = FrameLayout(this).apply {
+            contentDescription = "Take photograph"
+            isClickable = true
+            isFocusable = true
+            background = oval(Color.TRANSPARENT, Color.WHITE, 3)
+            setOnClickListener { if (!busy) takePhoto() }
+        }
+        captureRow.addView(shutter, LinearLayout.LayoutParams(dp(89), dp(89)))
+        shutter.addView(View(this).apply {
+            background = oval(Color.WHITE)
+        }, FrameLayout.LayoutParams(dp(69), dp(69), Gravity.CENTER))
+        val switch = FrameLayout(this).apply {
+            contentDescription = "Switch front and back cameras"
+            isClickable = true
+            isFocusable = true
+            setOnClickListener {
+                if (!busy) {
+                    selector = if (selector == CameraSelector.DEFAULT_BACK_CAMERA)
+                        CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
+                    currentZoom = 1f
+                    startCamera()
+                }
+            }
+        }
+        captureRow.addView(switch, LinearLayout.LayoutParams(0, dp(75), 1f))
+        switch.addView(txt("↻", 36f), FrameLayout.LayoutParams(dp(62), dp(62), Gravity.CENTER))
+
+        reviewRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            visibility = View.GONE
+            setPadding(dp(5), dp(11), dp(5), dp(11))
+        }
+        footer.addView(reviewRow, LinearLayout.LayoutParams(-1, dp(110)))
+        fun reviewButton(caption: String, primary: Boolean = false, onTap: () -> Unit) {
+            val btn = txt(caption, 11f, if (primary) Color.BLACK else Color.WHITE, true).apply {
+                background = rounded(if (primary) gold else Color.rgb(36, 38, 45), 12)
+                setOnClickListener { onTap() }
+            }
+            reviewRow.addView(btn, LinearLayout.LayoutParams(0, dp(49), if (primary) 1.28f else 1f).apply {
+                leftMargin = dp(4); rightMargin = dp(4)
+            })
+        }
+        reviewButton("BEFORE / AFTER") {
+            if (!busy && original != null && enhanced != null) {
+                showingOriginal = !showingOriginal
+                photoView.setImageBitmap(if (showingOriginal) original else enhanced)
+                status(if (showingOriginal) "ภาพต้นฉบับ" else "ภาพที่ปรับแล้ว")
+            }
+        }
+        reviewButton("SAVE BOTH", true) { if (!busy) save() }
+        reviewButton("RETAKE") { if (!busy) showReview(false) }
+
+        message = txt("● READY  •  TAP TO FOCUS", 10f, Color.rgb(151, 154, 160))
+        footer.addView(message, LinearLayout.LayoutParams(-1, dp(29)))
+    }
+
+    private fun refreshModes() {
+        modes.forEach { (key, button) ->
+            button.setTextColor(if (key == mode) gold else Color.LTGRAY)
+            button.typeface = Typeface.create("sans-serif-medium",
+                if (key == mode) Typeface.BOLD else Typeface.NORMAL)
+        }
+    }
+
+    private fun showReview(show: Boolean) {
+        photoView.visibility = if (show) View.VISIBLE else View.GONE
+        captureRow.visibility = if (show) View.GONE else View.VISIBLE
+        reviewRow.visibility = if (show) View.VISIBLE else View.GONE
+        zoomBar.visibility = if (show) View.GONE else View.VISIBLE
+        grid.visibility = if (gridOn && !show) View.VISIBLE else View.GONE
+        focusRing.visibility = View.GONE
+        if (!show) status("● READY  •  " + mode.uppercase() + "  •  TAP TO FOCUS")
+    }
+
+    private fun cycleFlash() {
+        flashMode = when (flashMode) {
+            ImageCapture.FLASH_MODE_OFF -> ImageCapture.FLASH_MODE_AUTO
+            ImageCapture.FLASH_MODE_AUTO -> ImageCapture.FLASH_MODE_ON
+            else -> ImageCapture.FLASH_MODE_OFF
+        }
+        capture?.flashMode = flashMode
+        flashControl.text = when (flashMode) {
+            ImageCapture.FLASH_MODE_AUTO -> "⚡ AUTO"
+            ImageCapture.FLASH_MODE_ON -> "⚡ ON"
+            else -> "⚡ OFF"
+        }
+        flashControl.setTextColor(if (flashMode == ImageCapture.FLASH_MODE_OFF) Color.WHITE else gold)
+        status("FLASH " + flashControl.text)
+    }
+
+    private fun refreshZoom() {
+        val state = camera?.cameraInfo?.zoomState?.value
+        zoomControls.forEach { (ratio, button) ->
+            val valid = state != null &&
+                ratio >= state.minZoomRatio - 0.015f && ratio <= state.maxZoomRatio + 0.015f
+            button.isEnabled = valid
+            button.alpha = if (valid) 1f else 0.30f
+            val active = valid && kotlin.math.abs(currentZoom - ratio) < 0.02f
+            button.background = oval(if (active) gold else Color.TRANSPARENT)
+            button.setTextColor(if (active) Color.BLACK else Color.WHITE)
+        }
+    }
+
+    private fun setZoom(ratio: Float) {
+        val activeCamera = camera ?: return
+        val state = activeCamera.cameraInfo.zoomState.value ?: return
+        if (ratio < state.minZoomRatio - 0.015f || ratio > state.maxZoomRatio + 0.015f) return
+        currentZoom = ratio.coerceIn(state.minZoomRatio, state.maxZoomRatio)
+        activeCamera.cameraControl.setZoomRatio(currentZoom)
+        refreshZoom()
+        status("ZOOM " + ratio.toString() + "×")
+    }
+
+    private fun focusAt(x: Float, y: Float) {
+        val activeCamera = camera ?: return
+        val point = viewFinder.meteringPointFactory.createPoint(x, y)
+        activeCamera.cameraControl.startFocusAndMetering(FocusMeteringAction.Builder(point).build())
+        val lp = focusRing.layoutParams as FrameLayout.LayoutParams
+        lp.leftMargin = (x.toInt() - dp(32)).coerceAtLeast(0)
+        lp.topMargin = (y.toInt() - dp(32)).coerceAtLeast(0)
+        focusRing.layoutParams = lp
+        focusRing.animate().cancel()
+        focusRing.alpha = 1f
+        focusRing.visibility = View.VISIBLE
+        focusRing.animate().alpha(0f).setDuration(800L).withEndAction {
+            focusRing.visibility = View.GONE
+        }.start()
+    }
+
+    private class ThirdsGrid(context: Context) : View(context) {
+        private val pen = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(110, 255, 255, 255)
+            strokeWidth = context.resources.displayMetrics.density
+        }
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            for (i in 1..2) {
+                val x = width * i / 3f
+                val y = height * i / 3f
+                canvas.drawLine(x, 0f, x, height.toFloat(), pen)
+                canvas.drawLine(0f, y, width.toFloat(), y, pen)
+            }
+        }
     }
 
     private fun status(s: String) { message.text = s }
@@ -186,20 +458,25 @@ class MainActivity : ComponentActivity() {
                 val preview = Preview.Builder().build().also { it.setSurfaceProvider(viewFinder.surfaceProvider) }
                 capture = ImageCapture.Builder().setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY).build()
                 provider.unbindAll()
-                provider.bindToLifecycle(this, selector, preview, capture)
+                camera = provider.bindToLifecycle(this, selector, preview, capture)
+                capture?.flashMode = flashMode
+                currentZoom = 1f
+                refreshZoom()
             } catch (e: Exception) { status("ไม่สามารถเปิดกล้อง: ${e.localizedMessage}") }
         }, ContextCompat.getMainExecutor(this))
     }
 
     private fun takePhoto() {
         val camera = capture ?: run { status("กำลังเตรียมกล้อง"); return }
+        busy = true
+        status("กำลังถ่ายภาพ...")
         val file = File.createTempFile("lumacam_", ".jpg", cacheDir)
         camera.takePicture(
             ImageCapture.OutputFileOptions.Builder(file).build(),
             ContextCompat.getMainExecutor(this),
             object : ImageCapture.OnImageSavedCallback {
                 override fun onImageSaved(output: ImageCapture.OutputFileResults) { process(Uri.fromFile(file)) }
-                override fun onError(exception: ImageCaptureException) { status("ถ่ายภาพไม่สำเร็จ: ${exception.message}") }
+                override fun onError(exception: ImageCaptureException) { busy = false; status("ถ่ายภาพไม่สำเร็จ: ${exception.message}") }
             }
         )
     }
@@ -251,7 +528,9 @@ class MainActivity : ComponentActivity() {
                 enhanced = output
                 showingOriginal = false
                 photoView.setImageBitmap(output)
-                photoView.visibility = View.VISIBLE
+                thumbnail.setImageBitmap(output)
+                galleryGlyph.visibility = View.GONE
+                showReview(true)
                 status("ปรับภาพด้วย $mode สำเร็จ ${if (mode == "Portrait") "· พบใบหน้า ${faceBoxes.size}" else "· ทำงานบนเครื่อง"}")
             } catch (e: Exception) { status("ประมวลผลไม่ได้: ${e.localizedMessage}") }
             finally { busy = false }
@@ -270,7 +549,9 @@ class MainActivity : ComponentActivity() {
                 enhanced = edited
                 showingOriginal = false
                 photoView.setImageBitmap(edited)
-                photoView.visibility = View.VISIBLE
+                thumbnail.setImageBitmap(edited)
+                galleryGlyph.visibility = View.GONE
+                showReview(true)
                 status("ปรับภาพโหมด $mode สำเร็จ")
             } catch (e: Exception) { status("ไม่สามารถปรับภาพได้: ${e.localizedMessage}") }
             finally { busy = false }
