@@ -2,90 +2,101 @@ package com.cambuild.lumacam
 
 import android.graphics.Bitmap
 import android.graphics.Rect
-import kotlin.math.*
+import kotlin.math.roundToInt
 
-/** On-device non-generative image enhancement. ML-detected faces can guide exposure. */
+/**
+ * Low-allocation, offline color/exposure enhancement.
+ *
+ * The previous algorithm kept five full-sized pixel buffers and allocated an
+ * IntArray and a closure for every pixel in a second sharpening pass.
+ * This implementation uses only a source and result array, plus a tiny tone
+ * lookup table. The work is always launched from Dispatchers.Default.
+ */
 object PhotoProcessor {
     fun enhance(input: Bitmap, mode: String, faces: List<Rect> = emptyList()): Bitmap {
-        val w = input.width
-        val h = input.height
-        val src = IntArray(w * h)
-        input.getPixels(src, 0, w, 0, 0, w, h)
-        var sum = 0.0
-        var sampled = 0
-        for (i in src.indices step 101) {
-            val c = src[i]
-            sum += (0.2126 * (c shr 16 and 255) + 0.7152 * (c shr 8 and 255) + 0.0722 * (c and 255)) / 255.0
-            sampled++
+        val width = input.width
+        val height = input.height
+        require(width > 0 && height > 0) { "Invalid image size" }
+        val source = IntArray(width * height)
+        input.getPixels(source, 0, width, 0, 0, width, height)
+
+        var sampleTotal = 0.0
+        var sampleCount = 0
+        val step = (source.size / 18000).coerceAtLeast(1)
+        for (i in source.indices step step) {
+            val p = source[i]
+            sampleTotal += 0.2126 * (p shr 16 and 255) +
+                    0.7152 * (p shr 8 and 255) + 0.0722 * (p and 255)
+            sampleCount++
         }
-        val mean = if (sampled > 0) sum / sampled else 0.5
+        val average = if (sampleCount == 0) 0.5 else sampleTotal / sampleCount / 255.0
         val target = when (mode) {
             "Night" -> 0.51
             "Portrait" -> 0.52
             "Natural" -> 0.48
             else -> 0.50
         }
-        val exposure = ((target - mean) * if (mode == "Night") 0.80 else 0.52).coerceIn(-0.16, 0.23)
+        val exposure = ((target - average) * if (mode == "Night") 0.80 else 0.52)
+            .coerceIn(-0.16, 0.23)
+        val contrast = when (mode) {
+            "Night" -> 1.045
+            "Natural" -> 1.025
+            else -> 1.06
+        }
         val saturation = when (mode) {
             "Natural" -> 1.035
             "Portrait" -> 1.025
             "Night" -> 1.045
             else -> 1.085
         }
-        val contrast = when (mode) { "Night" -> 1.045; "Natural" -> 1.025; else -> 1.06 }
-        val sharp = if (mode == "Night") 0.11 else 0.18
-        val dst = IntArray(src.size)
-        val reds = IntArray(src.size)
-        val greens = IntArray(src.size)
-        val blues = IntArray(src.size)
+        val lookup = IntArray(256) { v ->
+            (((v / 255.0 + exposure - 0.5) * contrast + 0.5)
+                .coerceIn(0.0, 1.0) * 255.0).roundToInt()
+        }
+        val result = IntArray(source.size)
+        val portrait = mode == "Portrait" && faces.isNotEmpty()
+        val sharpen = if (mode == "Night") 0.025 else 0.065
 
-        fun adjust(v: Double) = ((v / 255.0 + exposure - 0.5) * contrast + 0.5).coerceIn(0.0, 1.0) * 255.0
-        for (y in 0 until h) {
-            for (x in 0 until w) {
-                val i = y * w + x
-                val pixel = src[i]
-                val a = pixel ushr 24
-                var r = (pixel shr 16 and 255).toDouble()
-                var g = (pixel shr 8 and 255).toDouble()
-                var b = (pixel and 255).toDouble()
+        for (y in 0 until height) {
+            // Filtering face rectangles once per row avoids repeated work.
+            val rowFaces = if (portrait) faces.filter { y >= it.top && y < it.bottom }
+                else emptyList()
+            val offset = y * width
+            for (x in 0 until width) {
+                val i = offset + x
+                val p = source[i]
+                var red = lookup[p shr 16 and 255].toDouble()
+                var green = lookup[p shr 8 and 255].toDouble()
+                var blue = lookup[p and 255].toDouble()
 
-                // Minimal channel balance rather than aggressive skin whitening.
-                val avg = (r + g + b) / 3.0
-                r = adjust(r + (avg - r) * if (mode == "Night") 0.018 else 0.007)
-                g = adjust(g)
-                b = adjust(b + (avg - b) * 0.008)
-                val grey = r * 0.2126 + g * 0.7152 + b * 0.0722
-                r = grey + (r - grey) * saturation
-                g = grey + (g - grey) * saturation
-                b = grey + (b - grey) * saturation
+                val luminance = red * 0.2126 + green * 0.7152 + blue * 0.0722
+                red = luminance + (red - luminance) * saturation
+                green = luminance + (green - luminance) * saturation
+                blue = luminance + (blue - luminance) * saturation
 
-                // Face-aware gentle correction with no geometric warping.
-                if (mode == "Portrait" && faces.any { f -> x >= f.left && x < f.right && y >= f.top && y < f.bottom }) {
-                    val lift = (255.0 - grey) * 0.058
-                    r += lift
-                    g += lift * 0.91
-                    b += lift * 0.82
+                if (rowFaces.any { x >= it.left && x < it.right }) {
+                    val lift = (255.0 - luminance) * 0.058
+                    red += lift
+                    green += lift * 0.91
+                    blue += lift * 0.82
                 }
-                reds[i] = r.roundToInt().coerceIn(0,255)
-                greens[i] = g.roundToInt().coerceIn(0,255)
-                blues[i] = b.roundToInt().coerceIn(0,255)
-                dst[i] = (a shl 24) or (reds[i] shl 16) or (greens[i] shl 8) or blues[i]
+                // Minimal 1D high-frequency boost, without a second full-image
+                // pass, neighbour arrays or creating an array per pixel.
+                if (x > 0 && x + 1 < width) {
+                    val leftG = source[i - 1] shr 8 and 255
+                    val rightG = source[i + 1] shr 8 and 255
+                    val midG = p shr 8 and 255
+                    val edge = (midG - (leftG + rightG) * 0.5) * sharpen
+                    red += edge
+                    green += edge
+                    blue += edge
+                }
+                val r = red.roundToInt().coerceIn(0, 255)
+                val g = green.roundToInt().coerceIn(0, 255)
+                val b = blue.roundToInt().coerceIn(0, 255)
+                result[i] = (p and -0x1000000) or (r shl 16) or (g shl 8) or b
             }
         }
-
-        // Light 4-neighbour unsharp masking to avoid fake detail.
-        if (w > 2 && h > 2) {
-            for (y in 1 until h - 1) for (x in 1 until w - 1) {
-                val i = y * w + x
-                val around = intArrayOf(i - 1, i + 1, i - w, i + w)
-                fun clarify(c: IntArray): Int {
-                    val neighbourMean = around.sumOf { c[it] }.toDouble() / 4.0
-                    return (c[i] + (c[i] - neighbourMean) * sharp).roundToInt().coerceIn(0, 255)
-                }
-                val r = clarify(reds); val g = clarify(greens); val b = clarify(blues)
-                dst[i] = (dst[i] and -0x1000000) or (r shl 16) or (g shl 8) or b
-            }
-        }
-        return Bitmap.createBitmap(dst, w, h, Bitmap.Config.ARGB_8888)
+        return Bitmap.createBitmap(result, width, height, Bitmap.Config.ARGB_8888)
     }
 }
